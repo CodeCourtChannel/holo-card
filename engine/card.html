@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Holo Card</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@700&display=swap">
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; }
+  body { margin: 0; background: #02030a; color: #e8eefc; overflow: hidden; font: 13px/1.4 Inter, system-ui, sans-serif; }
+  canvas#gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  .tag { position: fixed; left: 0; top: 0; white-space: nowrap; pointer-events: none; font: 600 clamp(12px, 2.1vh, 22px) / 1.25 Inter, sans-serif; color: #f3f6ff; opacity: 0; }
+  .tag small { display: block; font-weight: 400; color: rgba(232, 238, 252, .72); font-size: .78em; }
+  .tag::before { content: ""; position: absolute; right: calc(100% + 8px); top: .62em; width: 5vh; border-top: 1px solid rgba(240, 199, 102, .85); }
+  .ui { position: fixed; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: center; gap: 12px; pointer-events: none;
+        padding: 14px max(16px, env(safe-area-inset-right, 0px)) calc(14px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); color: rgba(232, 238, 252, .6); }
+  .ui a { pointer-events: auto; color: #e8eefc; text-decoration: none; border: 1px solid rgba(232, 238, 252, .25); padding: 6px 12px; border-radius: 999px; }
+  body.rec .ui { display: none; } body.rec canvas#gl { cursor: none; }
+</style></head><body>
+<canvas id="gl"></canvas>
+<div id="tags"></div>
+<nav class="ui"><span>Move to tilt · click to pull the layers apart</span><span></span></nav>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const Q = new URLSearchParams(location.search), REC = Q.has('rec'), PURE = Q.has('pure'), FRONT = Q.has('front'), AUTO = REC || Q.has('auto');
+const POSE = Q.get('pose')?.split(',').map(Number), FLAT = Q.has('flat');   // test stills: ?pose=rx,ry holds a tilt (degrees); ?flat lays every step flat
+const [K, V = 'card'] = (Q.get('c') || decodeURIComponent(location.hash.slice(1)) || 'card').split(/:|--/), DIR = V === 'card' ? `${K}/` : `${K}/${V}/`;   // card.html#<name>, or #<name>--<version> for a version folder
+if (REC) document.body.classList.add('rec');
+const TAU = Math.PI * 2, clamp = (x, a, b) => Math.min(b, Math.max(a, x)), lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rand = (() => { let s = 23; return () => (s = (s * 16807) % 2147483647) / 2147483647; })();
+const C = await (await fetch(DIR + 'card.json')).json(), TH = C.theme, AD = C.assets || DIR;   // a version folder (v1-v3) keeps only its own maps + card.json; pictures and videos come from its base card
+document.title = `${TH.name} Holo Card`;
+const loadImg = src => new Promise((r, j) => { const im = new Image(); im.onload = () => r(im); im.onerror = j; im.src = src; });
+const names = ['color.webp', 'maps.png', 'blur.webp', 'glow.webp', 'plate.webp', ...(C.frame ? [C.frame] : [])];
+const IM = Object.fromEntries(await Promise.all(names.map(async n => [n, await loadImg((n === 'maps.png' ? DIR : AD) + n)])));
+const PIM = await Promise.all(C.planes.map(p => loadImg(AD + p.file)));
+const VIDS = [];   // looping videos; in ?rec each frame seeks them to the exact time first
+async function loadVid(src) {
+  const v = document.createElement('video'); v.src = src; v.muted = true; v.loop = true; v.playsInline = true; v.preload = 'auto';
+  await new Promise((r, j) => { v.onloadeddata = r; v.onerror = j; v.load(); });
+  v.width = v.videoWidth; v.height = v.videoHeight;   // three sizes a plain (?rec) video texture from these attributes; 0 x 0 leaves it black
+  if (!REC) v.play().catch(() => {});
+  const t = REC ? new THREE.Texture(v) : new THREE.VideoTexture(v); t.colorSpace = THREE.SRGBColorSpace; t.minFilter = THREE.LinearFilter; t.generateMipmaps = false;
+  VIDS.push({ v, t }); return { v, t };
+}
+const frameReady = v => new Promise(r => { let ok = false; const go = () => { if (!ok) { ok = true; r(); } };   // the decoded frame, not just 'seeked'
+  if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(go); setTimeout(go, 400); });
+const seekAll = t => Promise.all(VIDS.map(({ v, t: tx }) => new Promise(r => { const tt = t % v.duration;
+  const done = async () => { await frameReady(v); tx.needsUpdate = true; r(); };
+  if (Math.abs(v.currentTime - tt) < 1e-4) { tx.needsUpdate = true; return r(); } v.addEventListener('seeked', done, { once: true }); v.currentTime = tt; })));
+const BGV = C.bgVideo ? await loadVid(AD + C.bgVideo) : null; window.__vids = VIDS;
+const FAV = C.frameAnim ? await loadVid(AD + C.frameAnim) : null;
+
+// ---------- card space (CW x CH px, y down) -> world (1 = card width, y up, centred); the picture sits at IX0, IY0 scaled by IS
+const SCENE = !!C.scene, NBG = C.nbg || 0, ZB = C.zBg ?? -.36;
+const ZR = FLAT ? [-.002, 0] : (Q.get('zr')?.split(',').map(Number) || C.zr || [-.12, .14]), ZS = C.zScene ?? -.12;   // the subject's own depth range (a shallow range keeps its shape on tilt); ?zr=a,b tries one; zScene: where a scene relief starts
+const { CW, CH, W, H, IS, IX0, IY0 } = C, WIN = { x0: C.win[0], y0: C.win[1], x1: C.win[2], y1: C.win[3] };
+const wx = x => (x - CW / 2) / CW, wy = y => (CH / 2 - y) / CW;
+const v3c = a => new THREE.Vector3(...a);
+
+// ---------- renderer, camera, post
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.toneMapping = THREE.NoToneMapping; renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x02030a);
+const camera = new THREE.PerspectiveCamera(24, 1, .05, 100);
+const DC = 4.6; camera.position.set(0, 0, DC);   // every layer is scaled so that, seen from here, it lines up with the picture
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 }));
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(4, 4), 0, .5, TH.bloom[1]); composer.addPass(bloom);
+composer.addPass(new OutputPass());
+const HALF_H = CH / CW / 2;
+function resize() { const w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); composer.setSize(w, h); camera.aspect = w / h;
+  camera.fov = 2 * Math.atan(Math.max(HALF_H + .17, (.5 + .3) / camera.aspect) / DC) * 180 / Math.PI; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+
+const tex = (im, o = {}) => { const t = im instanceof HTMLVideoElement ? new THREE.VideoTexture(im) : new THREE.Texture(im);
+  t.colorSpace = o.data ? THREE.NoColorSpace : THREE.SRGBColorSpace; t.anisotropy = 8; if (o.mirror) t.wrapS = t.wrapT = THREE.MirroredRepeatWrapping; t.needsUpdate = true; return t; };
+const T = { color: tex(IM['color.webp']), maps: tex(IM['maps.png'], { data: true }), blur: tex(IM['blur.webp']), glow: tex(IM['glow.webp']), plate: tex(IM['plate.webp'], { mirror: true }) };
+
+// shared GLSL: value noise, fbm, the rounded window test (card px)
+const NOISE = /* glsl */`
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float vnoise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3. - 2. * f);
+    return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y); }
+  float fbm(vec2 p) { float s = 0., a = .5; for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = p * 2.03 + 17.1; a *= .5; } return s; }
+  uniform vec4 uWin; uniform float uWinR;
+  float inWin(vec2 c) { vec2 h = (uWin.zw - uWin.xy) * .5, q = abs(c - (uWin.xy + uWin.zw) * .5) - h + uWinR;
+    float d = length(max(q, 0.)) + min(max(q.x, q.y), 0.) - uWinR; float w = max(fwidth(d), .5); return 1. - smoothstep(-w, w, d); }`;
+const CAMU = { uPhys: { value: Q.has('nophys') ? 0 : C.phys ?? 1 }, uCam: { value: new THREE.Vector3(0, 0, DC) }, uCard: { value: new THREE.Vector2(CW, CH) } };   // clip what is behind the card by its window, as seen from the eye (?nophys: the old picture-space clip)
+const PHYS = /* glsl */`uniform float uPhys; uniform vec3 uCam; uniform vec2 uCard;
+  float physWin(vec3 p, float w) { if (uPhys < .5 || p.z >= 0.) return w; vec3 q = uCam + (p - uCam) * (uCam.z / (uCam.z - p.z));
+    return inWin(vec2(q.x * uCard.x + uCard.x * .5, uCard.y * .5 - q.y * uCard.x)); }`;
+const WINU = { uWin: { value: new THREE.Vector4(WIN.x0, WIN.y0, WIN.x1, WIN.y1) }, uWinR: { value: 22 } };
+
+const block = new THREE.Group(); scene.add(block);
+const layers = [];   // simple sheets: { mesh, z, ze, t0, label, a(=opacity scale) }
+// a quad for card rect [x0,x1]x[y0,y1] (card px); uv follows the picture placement (or the card itself with box 'card')
+function cardQuad(x0, y0, x1, y1, box) {
+  const g = new THREE.PlaneGeometry(1, 1), p = g.attributes.position, uv = g.attributes.uv;
+  g.setAttribute('card', new THREE.BufferAttribute(new Float32Array(8), 2));
+  for (let i = 0; i < 4; i++) {
+    const cx = p.getX(i) < 0 ? x0 : x1, cy = p.getY(i) > 0 ? y0 : y1;
+    p.setXYZ(i, wx(cx), wy(cy), 0); g.attributes.card.setXY(i, cx, cy);
+    let u = (cx - IX0) / IS / W, v = 1 - (cy - IY0) / IS / H;
+    if (box === 'card') { u = cx / CW; v = 1 - cy / CH; }
+    else if (box) { u = (u * W - box.x) / box.w; v = 1 - (((1 - v) * H - box.y) / box.h); }
+    uv.setXY(i, u, v);
+  }
+  return g;
+}
+const VS = /* glsl */`attribute vec2 card; uniform vec2 uPz; varying vec2 vUv, vCard; varying vec3 vPos; void main() { vUv = uv; vCard = card; vPos = vec3(position.xy * uPz.y, uPz.x); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }`;
+function sheet(geo, mat, z, ze, o = {}) {
+  const mesh = new THREE.Mesh(geo, mat); mesh.renderOrder = o.order ?? 1; block.add(mesh);
+  const L = { mesh, z, ze, t0: o.t0 ?? 0, label: o.label, fx: o.fx, ex: o.ex ?? 1, sx: o.sx };   // sx: in a v3 scene card only shown when pulled apart
+  layers.push(L); return L;
+}
+const U = { uTime: { value: 0 }, uTilt: { value: 0 }, uX: { value: 0 }, uFx: { value: PURE ? 0 : 1 } };   // shared by every effect
+
+// ---------- 1. the background: the picture with him removed, alive (glitter in its bright spots, drifting mist, breathing light)
+const vidXf = v => { if (!v) return new THREE.Vector4(1, 1, 0, 0); const va = v.videoWidth / v.videoHeight, pa = W / H;   // cover-fit: uv' = uv * s + o
+  return va > pa ? new THREE.Vector4(pa / va, 1, (1 - pa / va) / 2, 0) : new THREE.Vector4(1, va / pa, 0, (1 - va / pa) / 2); };
+const BGU = { ...U, ...WINU, ...CAMU, uPz: { value: new THREE.Vector2(0, 1) }, uMap: { value: BGV ? BGV.t : T.plate }, uXf: { value: vidXf(BGV && BGV.v) }, uTint: { value: v3c(TH.rays) }, uA: { value: 1 }, uVid: { value: BGV ? 1 : 0 } };
+const bgMat = new THREE.ShaderMaterial({ uniforms: BGU, transparent: true, depthWrite: false, vertexShader: VS,
+  fragmentShader: NOISE + PHYS + /* glsl */`uniform sampler2D uMap; uniform float uTime, uFx, uX, uA, uVid; uniform vec3 uTint; uniform vec4 uXf; varying vec2 vUv, vCard; varying vec3 vPos;
+    void main() {
+      vec2 uv = uVid > .5 ? clamp(vUv, 0., 1.) * uXf.xy + uXf.zw : vUv;
+      vec3 c = texture2D(uMap, uv).rgb;
+      float l = dot(c, vec3(.3, .59, .11));
+      vec2 cell = floor(vUv * vec2(${(W / 3).toFixed(1)}, ${(H / 3).toFixed(1)})); float r = hash(cell);
+      float tw = pow(max(sin(uTime * (1.2 + r * 3.) + r * 60.), 0.), 14.) * smoothstep(.42, .85, l);
+      float mist = fbm(vec2(vUv.x * 3. + uTime * .03, vUv.y * 5. - uTime * .05)) * smoothstep(.75, .0, vUv.y);
+      c += uFx * (c * tw * 2.2 + uTint * mist * .1 + c * .08 * sin(uTime * .8));
+      float edge = min(min(vCard.x - uWin.x, uWin.z - vCard.x), min(vCard.y - uWin.y, uWin.w - vCard.y));
+      c *= mix(1., .35 + .65 * smoothstep(-10., 90., edge), uFx * (1. - uX));   /* the box's inner shadow */
+      gl_FragColor = vec4(c, uA * mix(physWin(vPos, inWin(vCard)), 1., uX));
+      #include <colorspace_fragment>
+    }` });
+const BGPAD = 70;   // a little beyond the window: the tunnel walls hide the rest
+sheet(cardQuad(WIN.x0 - BGPAD, WIN.y0 - BGPAD, WIN.x1 + BGPAD, WIN.y1 + BGPAD), bgMat, ZB, -1.0, { sx: SCENE, order: 1, t0: .2, label: ['Background', C.labels?.bg ?? 'the picture with the character removed'] });
+
+// ---------- 2. the tunnel: four walls from the window back to the background, lit as the card turns
+const wallU = { ...U, uCol: { value: v3c(TH.bg) }, uRim: { value: v3c(TH.rays) }, uLit: { value: 1 }, uA: { value: 1 } };
+const walls = ['L', 'R', 'T', 'B'].map(side => {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({ uniforms: { ...wallU, uLit: { value: 1 } }, transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }',
+    fragmentShader: NOISE + `uniform vec3 uCol, uRim; uniform float uLit, uA, uTime; varying vec2 vUv;
+      void main(){ float d = clamp(vUv.y, 0., 1.);   /* pow() of a tiny negative is NaN, which bloom spreads into a white blob */ vec3 c = uCol * (.2 + .35 * uLit) * (.2 + .8 * d * d) + uRim * pow(d, 30.) * .25 * uLit;
+        c += uRim * .025 * d * fbm(vec2(vUv.x * 8., vUv.y * 3. - uTime * .2));
+        gl_FragColor = vec4(c, uA);
+        #include <colorspace_fragment>
+      }` }));
+  m.renderOrder = 2; block.add(m); return { m, side };
+});
+const Z_BACK = SCENE ? -.12 : ZB;
+function placeWalls(zb, a) {   // a wall joins the window edge at z = 0 to the background's edge at zb (both compensated for the camera)
+  const k = (DC - zb) / DC, x0 = wx(WIN.x0), x1 = wx(WIN.x1), y0 = wy(WIN.y0), y1 = wy(WIN.y1);
+  for (const { m, side } of walls) {
+    const P = side === 'L' ? [[x0, y1], [x0, y0]] : side === 'R' ? [[x1, y0], [x1, y1]] : side === 'T' ? [[x0, y0], [x1, y0]] : [[x1, y1], [x0, y1]];
+    const g = m.geometry.attributes.position;   // plane verts: 0 TL, 1 TR, 2 BL, 3 BR  -> v = 1 at the window, 0 at the back
+    g.setXYZ(0, P[0][0], P[0][1], 0); g.setXYZ(1, P[1][0], P[1][1], 0); g.setXYZ(2, P[0][0] * k, P[0][1] * k, zb); g.setXYZ(3, P[1][0] * k, P[1][1] * k, zb);
+    g.needsUpdate = true; m.material.uniforms.uA.value = a;
+  }
+}
+
+// ---------- 3. his technique as a glowing glyph behind him, and light rays
+function glyphCanvas() {
+  const S = 1024, c = document.createElement('canvas'); c.width = c.height = S; const g = c.getContext('2d'); if (TH.glyph === 'none') return c; g.translate(S / 2, S / 2);
+  const col = (a, k = 1) => `rgba(${TH.rays.map(v => Math.round(255 * Math.min(1, v * k))).join(',')},${a})`;
+  g.lineCap = 'round'; g.shadowBlur = 18; g.shadowColor = col(1);
+  const ring = (r, w, a) => { g.lineWidth = w; g.strokeStyle = col(a); g.beginPath(); g.arc(0, 0, r, 0, TAU); g.stroke(); };
+  if (TH.glyph === 'compass') {   // a twelve-point snowflake of compass needles
+    ring(470, 3, .7); ring(440, 1.5, .5); ring(300, 2, .5);
+    for (let i = 0; i < 72; i++) { const a = i * TAU / 72; g.lineWidth = i % 6 ? 1.5 : 4; g.strokeStyle = col(.7); g.beginPath(); g.moveTo(Math.cos(a) * 440, Math.sin(a) * 440); g.lineTo(Math.cos(a) * (i % 6 ? 425 : 405), Math.sin(a) * (i % 6 ? 425 : 405)); g.stroke(); }
+    for (let i = 0; i < 12; i++) { const L = i % 2 ? 260 : 400; g.save(); g.rotate(i * TAU / 12); g.lineWidth = 5; g.strokeStyle = col(.95, 1.3);
+      g.beginPath(); g.moveTo(0, -40); g.lineTo(0, -L); for (let k = 1; k <= 4; k++) { const y = -L * k / 5 - 20, b = L * (.17 - k * .025); g.moveTo(-b, y - b); g.lineTo(0, y); g.lineTo(b, y - b); } g.stroke(); g.restore(); }
+    g.strokeStyle = 'rgba(255,60,110,.85)'; g.shadowColor = '#ff3c6e'; g.lineWidth = 3; g.beginPath(); g.arc(0, 0, 360, 0, TAU); g.stroke();
+  } else if (TH.glyph === 'sun') {   // the sun god: wavy rays, a drum ring, cloud curls
+    ring(470, 3, .6); ring(250, 4, .8);
+    for (let i = 0; i < 24; i++) { g.save(); g.rotate(i * TAU / 24); g.lineWidth = i % 2 ? 4 : 7; g.strokeStyle = col(.9, 1.2); g.beginPath(); g.moveTo(0, -270);
+      for (let k = 0; k <= 10; k++) g.lineTo(Math.sin(k * 1.4) * 14, -270 - k * (i % 2 ? 15 : 19)); g.stroke(); g.restore(); }
+    for (let i = 0; i < 8; i++) { g.save(); g.rotate(i * TAU / 8 + .2); g.lineWidth = 4; g.strokeStyle = col(.75); for (let r = 0; r < 3; r++) { g.beginPath(); g.arc(0, -430, 18 + r * 12, Math.PI * .1, Math.PI * 1.6); g.stroke(); } g.restore(); }
+  } else {   // code: hexagon rings, braces, circuit traces and a cube
+    const hex = (r, w, a) => { g.lineWidth = w; g.strokeStyle = col(a); g.beginPath(); for (let i = 0; i <= 6; i++) g.lineTo(Math.cos(i * TAU / 6 + TAU / 12) * r, Math.sin(i * TAU / 6 + TAU / 12) * r); g.stroke(); };
+    hex(470, 3, .7); hex(440, 1.5, .45); ring(330, 2.5, .6);
+    for (let i = 0; i < 36; i++) { const a = i * TAU / 36, r0 = 335, r1 = 335 + 30 + (i * 37 % 60); g.lineWidth = 2; g.strokeStyle = col(.6);
+      g.beginPath(); g.moveTo(Math.cos(a) * r0, Math.sin(a) * r0); g.lineTo(Math.cos(a) * r1, Math.sin(a) * r1); g.lineTo(Math.cos(a + .04) * (r1 + 14), Math.sin(a + .04) * (r1 + 14)); g.stroke();
+      g.fillStyle = col(.9); g.beginPath(); g.arc(Math.cos(a + .04) * (r1 + 14), Math.sin(a + .04) * (r1 + 14), 4, 0, TAU); g.fill(); }
+    g.font = '700 150px "JetBrains Mono", monospace'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = col(.9, 1.3);
+    for (let i = 0; i < 6; i++) { g.save(); g.rotate(i * TAU / 6); g.fillText(i % 2 ? '}' : '{', 0, -395); g.restore(); }
+    g.lineWidth = 5; g.strokeStyle = col(.95, 1.3); const s = 130; g.beginPath();
+    for (const [a, b] of [[[0, -s], [s * .87, -s / 2]], [[s * .87, -s / 2], [s * .87, s / 2]], [[s * .87, s / 2], [0, s]], [[0, s], [-s * .87, s / 2]], [[-s * .87, s / 2], [-s * .87, -s / 2]], [[-s * .87, -s / 2], [0, -s]], [[0, 0], [0, s]], [[0, 0], [s * .87, -s / 2]], [[0, 0], [-s * .87, -s / 2]]]) { g.moveTo(...a); g.lineTo(...b); }
+    g.stroke();
+  }
+  return c;
+}
+const GLYPH = { cx: (WIN.x0 + WIN.x1) / 2, cy: WIN.y0 + (WIN.y1 - WIN.y0) * .42, r: (WIN.x1 - WIN.x0) * .62 };
+const glyphU = { ...U, ...WINU, ...CAMU, uPz: { value: new THREE.Vector2(0, 1) }, uMap: { value: tex(glyphCanvas()) }, uA: { value: 1 } };
+const additive = (fs, uniforms) => new THREE.ShaderMaterial({ uniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexShader: VS, fragmentShader: NOISE + PHYS + 'varying vec3 vPos;\n' + fs });
+sheet(cardQuad(GLYPH.cx - GLYPH.r, GLYPH.cy - GLYPH.r, GLYPH.cx + GLYPH.r, GLYPH.cy + GLYPH.r, 'card'), additive(/* glsl */`
+  uniform sampler2D uMap; uniform float uTime, uFx, uA, uX; varying vec2 vUv, vCard;
+  void main() {
+    vec2 p = (vCard - vec2(${GLYPH.cx.toFixed(1)}, ${GLYPH.cy.toFixed(1)})) / ${(2 * GLYPH.r).toFixed(1)};
+    float a = uTime * .06, s = sin(a), c = cos(a); vec2 q = mat2(c, -s, s, c) * p + .5;
+    vec4 g = texture2D(uMap, q); float pulse = .55 + .45 * sin(uTime * 1.6);
+    float k = g.a * (.35 + .4 * pulse) * uFx * uA * mix(physWin(vPos, inWin(vCard)), 1., uX);
+    gl_FragColor = vec4(g.rgb * k, k);
+  }`, glyphU), ZB * .83, -.86, { sx: SCENE, order: 3, t0: .9, fx: true, label: ['Magic glyph', C.labels?.glyph ?? 'drawn in light'] });
+const RAYU = { ...U, ...WINU, ...CAMU, uPz: { value: new THREE.Vector2(0, 1) }, uCol: { value: v3c(TH.rays) }, uA: { value: 1 } };
+sheet(cardQuad(WIN.x0, WIN.y0, WIN.x1, WIN.y1, 'card'), additive(/* glsl */`
+  uniform vec3 uCol; uniform float uTime, uFx, uA, uX; varying vec2 vUv, vCard;
+  void main() {
+    vec2 p = (vCard - vec2(${GLYPH.cx.toFixed(1)}, ${GLYPH.cy.toFixed(1)})) / ${(WIN.x1 - WIN.x0).toFixed(1)};
+    float an = atan(p.y, p.x), r = length(p);
+    float rays = pow(max(.5 + .5 * sin(an * 13. + uTime * .25 + sin(an * 5. - uTime * .3) * 1.7), 0.), 5.) * smoothstep(.95, .05, r) * smoothstep(.0, .12, r);
+    float k = rays * .28 * uFx * uA * physWin(vPos, inWin(vCard)) * (1. - uX);
+    gl_FragColor = vec4(uCol * k, k);
+  }`, RAYU), ZB * .8, -.29, { sx: SCENE, order: 3, t0: 1.1, fx: true });
+
+// ---------- 4. extra planes (card.json planes: e.g. crystals or a title) behind and in front of him
+// a plane with pop: true breaks out of the window over the frame (e.g. a whale swimming out of the card); swim: <card units> lets it drift gently
+const planeMat = (im, front, p = {}) => new THREE.ShaderMaterial({ uniforms: { ...U, ...WINU, ...CAMU, uPz: { value: new THREE.Vector2(0, 1) }, uMap: { value: tex(im) }, uA: { value: 1 }, uFront: { value: front ? 1 : 0 },
+    uPopP: { value: p.pop ? 1 : 0 }, uSwim: { value: p.swim || 0 }, uGlit: { value: p.glitter ?? 1 } },   // glitter: 0 for a creature (the sparkle suits crystals)
+  transparent: true, depthWrite: false,
+  vertexShader: /* glsl */`attribute vec2 card; uniform vec2 uPz; uniform float uSwim, uTime; varying vec2 vUv, vCard; varying vec3 vPos;
+    void main() { vUv = uv; vCard = card; vec3 q = position; q.xy += uSwim * vec2(sin(uTime * .45), .55 * sin(uTime * .62 + 1.)); vPos = vec3(q.xy * uPz.y, uPz.x);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(q, 1.); }`,
+  fragmentShader: NOISE + PHYS + /* glsl */`uniform sampler2D uMap; uniform float uA, uFront, uX, uTime, uFx, uPopP, uGlit; varying vec2 vUv, vCard; varying vec3 vPos;
+    void main() { vec4 c = texture2D(uMap, vUv); float a = c.a * uA * (uPopP > .5 ? 1. : mix(physWin(vPos, inWin(vCard)), 1., uX));
+      float r = hash(floor(vUv * 180.)); c.rgb *= 1. + uFx * .9 * uGlit * pow(max(sin(uTime * (1.5 + r * 2.) + r * 40.), 0.), 10.);
+      if (a < .004) discard; gl_FragColor = vec4(c.rgb, a);
+      #include <colorspace_fragment>
+    }` });
+C.planes.forEach((p, i) => { const front = p.z > 0, x0 = IX0 + p.x * IS, y0 = IY0 + p.y * IS;
+  sheet(cardQuad(x0, y0, x0 + p.w * IS, y0 + p.h * IS, p), planeMat(PIM[i], front, p), p.z, p.ze, { order: front ? 9 : SCENE ? 6.5 : 4, t0: front ? 2.5 : .6, label: p.label }); });
+
+// ---------- 5. the aura: flames of light around his outline
+const AURAU = { ...U, ...WINU, ...CAMU, uPz: { value: new THREE.Vector2(0, 1) }, uMaps: { value: T.maps }, uA0: { value: v3c(TH.aura[0]) }, uA1: { value: v3c(TH.aura[1]) }, uA: { value: 1 }, uAmt: { value: TH.auraAmt ?? 1 } };
+sheet(cardQuad(IX0, IY0, IX0 + W * IS, IY0 + H * IS), additive(/* glsl */`
+  uniform sampler2D uMaps; uniform vec3 uA0, uA1; uniform float uTime, uFx, uA, uX, uAmt; varying vec2 vUv, vCard;
+  void main() {
+    vec4 m = texture2D(uMaps, vUv);
+    float n = fbm(vec2(vUv.x * 7., vUv.y * 5. - uTime * .45)), n2 = fbm(vec2(vUv.x * 13. + 3., vUv.y * 9. - uTime * .8));
+    float f = m.b * (1. - m.g) * (.55 + .9 * n) + m.b * m.g * .25;
+    float flame = smoothstep(.45, 1.05, f + n2 * .35) * (.75 + .25 * sin(uTime * 2.1));
+    vec3 col = mix(uA0, uA1, smoothstep(.3, .8, n2)) * flame;
+    float k = uFx * uA * mix(physWin(vPos, inWin(vCard)), 1., uX) * .95 * uAmt;
+    gl_FragColor = vec4(col * k, k * flame);
+  }`, AURAU), Math.min(-.13, ZR[0] - .01), -.16, { sx: SCENE, order: 5, t0: 1.6, fx: true, label: ['Aura', C.labels?.aura ?? 'light around the outline'] });
+
+// ---------- 6. the character: ONE figure as nested steps (edges at the back, centre in front) + walls, instanced, in two draws
+const NS = C.thresholds.length, Z1 = ZR[1], WALLS = 2;   // v3 scene steps run from ZS up to his range; his own steps span ZR
+const zAt = i => C.zs && !FLAT && !Q.get('zr') ? C.zs[i] : i < NBG ? ZS + (ZR[0] - ZS) * i / NBG : ZR[0] + (ZR[1] - ZR[0]) * (i - NBG) / Math.max(1, NS - 1 - NBG), zeAt = i => -.1 + i * .022;
+function stepMesh(lo, hi, order) {
+  if (lo >= hi) return null;   // e.g. no back steps when his whole range sits in front
+  const inst = [];   // [z, ze, t, nextT, shade, start, box x0 y0 x1 y1]
+  for (let i = lo; i < hi; i++) {
+    const z = zAt(i), ze = zeAt(i), t = C.thresholds[i], start = 1.3 + i * .045, b = C.boxes[i];
+    if (i) for (let c = 1; c <= WALLS; c++) inst.push([zAt(i - 1) + (z - zAt(i - 1)) * c / (WALLS + 1), ze, t, -1, .45 + .4 * c / (WALLS + 1), start, ...b]);
+    inst.push([z, ze, t, i < NS - 1 ? C.thresholds[i + 1] : -1, 1, start, ...b]);
+  }
+  const g = new THREE.InstancedBufferGeometry(); const q = new THREE.PlaneGeometry(1, 1); g.index = q.index; g.setAttribute('position', q.attributes.position); g.setAttribute('uv', q.attributes.uv);
+  g.instanceCount = inst.length;
+  const col = (k, n) => new THREE.InstancedBufferAttribute(new Float32Array(inst.flatMap(r => r.slice(k, k + n))), n);
+  g.setAttribute('aZ', col(0, 1)); g.setAttribute('aZe', col(1, 1)); g.setAttribute('aT', col(2, 1)); g.setAttribute('aNextT', col(3, 1));
+  g.setAttribute('aShade', col(4, 1)); g.setAttribute('aStart', col(5, 1)); g.setAttribute('aBox', col(6, 4));
+  const m = new THREE.Mesh(g, stepMat); m.frustumCulled = false; m.renderOrder = order; block.add(m); return m;
+}
+const SU = { ...U, ...WINU, uColor: { value: T.color }, uMaps: { value: T.maps }, uBlur: { value: T.blur }, uGlowMap: { value: T.glow }, uDc: { value: DC },
+  uArt: { value: new THREE.Vector4(IX0, IY0, W * IS, H * IS) }, uCard: { value: new THREE.Vector2(CW, CH) }, uTexel: { value: new THREE.Vector2(1 / W, 1 / H) },
+  uLight: { value: new THREE.Vector3(-.45, .55, .7).normalize() }, uNM: { value: new THREE.Matrix3() }, uL2: { value: new THREE.Vector2(0, 1) },
+  uRim: { value: v3c(TH.rim) }, uGlow: { value: TH.glow }, uPop: { value: 1 }, uOpen: { value: 0 }, uMaskMode: { value: Q.has('mask') ? 1 : 0 },   /* ?mask: his steps plain white (tools/bend.py) */
+  uScene: { value: SCENE ? 1 : 0 }, uBgFull: { value: C.bgFull && BGV ? 1 : 0 }, ...CAMU, uBgMap: { value: BGV ? BGV.t : T.plate }, uXf: { value: vidXf(BGV && BGV.v) }, uVidOn: { value: BGV ? 1 : 0 }, uGlyph: glyphU.uMap,
+  uA0: { value: v3c(TH.aura[0]) }, uA1: { value: v3c(TH.aura[1]) }, uAmt: { value: TH.auraAmt ?? 1 }, uRays: { value: v3c(TH.rays) } };
+const stepMat = new THREE.ShaderMaterial({ uniforms: SU, transparent: true, depthWrite: false, toneMapped: false,
+  vertexShader: /* glsl */`
+    attribute float aZ, aZe, aT, aNextT, aShade, aStart; attribute vec4 aBox;
+    uniform float uX, uTime, uDc; uniform vec4 uArt; uniform vec2 uCard;
+    varying vec2 vUv, vCard; varying float vT, vNextT, vShade, vP, vFront; varying vec3 vPos;
+    void main() {
+      float p = clamp((uTime - aStart) / .9, 0., 1.), e = 1. - (1. - p) * (1. - p) * (1. - p);
+      float z = mix(-.36, mix(aZ, aZe, uX), e);      /* each step rises out of the background to its depth */
+      vec2 pu = mix(aBox.xy, aBox.zw, uv * vec2(1., -1.) + vec2(0., 1.));   /* picture uv, y down */
+      vec2 card = uArt.xy + pu * uArt.zw;
+      vec3 pos = vec3((card.x - uCard.x * .5) / uCard.x, (uCard.y * .5 - card.y) / uCard.x, z);
+      pos.xy *= (uDc - z) / uDc;
+      vPos = pos; vUv = vec2(pu.x, 1. - pu.y); vCard = card; vT = aT; vNextT = aNextT; vShade = aShade; vP = p; vFront = step(0., aZ);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.);
+    }`,
+  fragmentShader: NOISE + PHYS + /* glsl */`
+    uniform sampler2D uColor, uMaps, uBlur, uGlowMap; uniform float uMaskMode, uX, uTime, uTilt, uFx, uGlow, uPop, uOpen; uniform vec2 uTexel, uL2; uniform vec3 uLight, uRim; uniform mat3 uNM;
+    uniform sampler2D uBgMap, uGlyph; uniform vec4 uXf; uniform float uScene, uVidOn, uAmt, uBgFull; uniform vec3 uA0, uA1, uRays;
+    varying vec2 vUv, vCard; varying float vT, vNextT, vShade, vP, vFront; varying vec3 vPos;
+    vec3 sceneBg(vec4 m) {   /* v3: the scene part of the relief = the animated background with its glyph, rays and aura painted on it */
+      vec2 uv = uVidOn > .5 ? clamp(vUv, 0., 1.) * uXf.xy + uXf.zw : vUv;
+      vec3 c = texture2D(uBgMap, uv).rgb;
+      float mist = fbm(vec2(vUv.x * 3. + uTime * .03, vUv.y * 5. - uTime * .05)) * smoothstep(.75, .0, vUv.y);
+      c += uFx * (uRays * mist * .1 + c * .08 * sin(uTime * .8));
+      float edge = min(min(vCard.x - uWin.x, uWin.z - vCard.x), min(vCard.y - uWin.y, uWin.w - vCard.y));
+      c *= mix(1., .45 + .55 * smoothstep(-10., 90., edge), uFx * (1. - uX));
+      vec2 p = (vCard - vec2(${GLYPH.cx.toFixed(1)}, ${GLYPH.cy.toFixed(1)})) / ${(2 * GLYPH.r).toFixed(1)};
+      float ga = uTime * .06, gs = sin(ga), gc = cos(ga); vec2 q = mat2(gc, -gs, gs, gc) * p + .5;
+      vec4 g = texture2D(uGlyph, q); float gk = g.a * (.35 + .4 * (.55 + .45 * sin(uTime * 1.6))) * uFx * step(abs(q.x - .5), .5) * step(abs(q.y - .5), .5);
+      c += g.rgb * gk * gk;
+      vec2 pr = (vCard - vec2(${GLYPH.cx.toFixed(1)}, ${GLYPH.cy.toFixed(1)})) / ${(WIN.x1 - WIN.x0).toFixed(1)};
+      float an = atan(pr.y, pr.x), r = length(pr);
+      float rk = pow(max(.5 + .5 * sin(an * 13. + uTime * .25 + sin(an * 5. - uTime * .3) * 1.7), 0.), 5.) * smoothstep(.95, .05, r) * smoothstep(.0, .12, r) * .28 * uFx;
+      c += uRays * rk * rk;
+      float n = fbm(vec2(vUv.x * 7., vUv.y * 5. - uTime * .45)), n2 = fbm(vec2(vUv.x * 13. + 3., vUv.y * 9. - uTime * .8));
+      float f = m.b * (1. - m.g) * (.55 + .9 * n);
+      float flame = smoothstep(.45, 1.05, f + n2 * .35) * (.75 + .25 * sin(uTime * 2.1)), ak = uFx * .95 * uAmt;
+      c += mix(uA0, uA1, smoothstep(.3, .8, n2)) * flame * ak * ak * flame;
+      return c;
+    }
+    void main() {
+      vec4 m = texture2D(uMaps, vUv); float h = m.r, a = m.g, A = uScene > .5 ? 1. : a;
+      float w = max(fwidth(h) * .85, .0015);         /* anti-aliased step edge at any size */
+      float al = vT <= 0. ? A : smoothstep(vT - w, vT + w, h) * A;
+      float inner = vNextT > 0. ? smoothstep(vNextT - w, vNextT + w, h) : 0.;
+      if (vShade < 1.) al *= 1. - uX;
+      float win = physWin(vPos, inWin(vCard));   /* real-depth cards: the frame's window hides what is behind it, as seen from the eye */
+      float pop = vFront * uPop * step(.999, vP) * step(vCard.y, uWin.y + 30.) * step(uWin.x, vCard.x) * step(vCard.x, uWin.z) * step(14., vCard.y);   /* above the window: front steps may break out */
+      al *= vP * max(mix(win, 1., max(uX, uOpen)), pop);
+      al *= mix(1., a, uX * uScene);   /* pulled apart, a v3 card's scene steps let go of the background */
+      if (al < .003) discard;
+      vec3 c = texture2D(uColor, vUv).rgb;
+      c = mix(c, texture2D(uBlur, vUv).rgb, uX * inner);
+      if (uScene > .5 && (a < .999 || uBgFull > .5)) c = uBgFull > .5 ? sceneBg(m) : mix(sceneBg(m), c, a);   /* bgFull: the whole picture comes from the living clip */
+      float hl = texture2D(uMaps, vUv - vec2(uTexel.x * 3., 0.)).r, hr = texture2D(uMaps, vUv + vec2(uTexel.x * 3., 0.)).r;
+      float hd = texture2D(uMaps, vUv - vec2(0., uTexel.y * 3.)).r, hu = texture2D(uMaps, vUv + vec2(0., uTexel.y * 3.)).r;
+      vec2 gr = vec2(hr - hl, hu - hd);
+      vec3 n = normalize(uNM * normalize(vec3(-gr * 22., 1.)));   /* his surface normal, from the smooth height map */
+      float lam = dot(n, uLight);
+      c *= 1. + uFx * uTilt * (.22 * lam - .06) * (vShade < 1. ? 1.6 : 1.);   /* soft relief light that moves with the tilt: one smooth body, no stripes */
+      c += uRim * pow(max(dot(reflect(-uLight, n), vec3(0., 0., 1.)), 0.), 24.) * .25 * uTilt * uFx;   /* a glossy highlight */
+      float pulse = .55 + .45 * sin(uTime * 2.3 - vUv.y * 14.);   /* energy running through the markings */
+      c += texture2D(uGlowMap, vUv).rgb * uGlow * pulse * uFx;
+      gl_FragColor = vec4(mix(c, vec3(1.), uMaskMode), al * mix(1., mix(1., a, uScene), uMaskMode));   /* a scene card's mask = him only */
+      #include <colorspace_fragment>
+    }` });
+let firstFront = C.thresholds.findIndex((_, i) => i >= NBG && zAt(i) >= 0); if (firstFront < 0) firstFront = NS;
+const sceneSteps = SCENE ? stepMesh(0, NBG, 6) : null, backSteps = stepMesh(NBG, firstFront, SCENE ? 7 : 6), frontSteps = stepMesh(firstFront, NS, 8);
+const stepLabel = { z: Z1, ze: zeAt(NS - 1), label: [TH.name, `one figure, ${NS} depth steps: edges at the back, centre in front`] };
+
+// ---------- 7. the frame (art with its window cut out): holographic foil that shifts as the card turns, glitter, a light sweep
+const FU = { ...U, uMap: { value: C.frame ? tex(IM[C.frame]) : null }, uAnim: { value: FAV ? FAV.t : null }, uHasAnim: { value: FAV ? 1 : 0 }, uTiltV: { value: new THREE.Vector2() }, uSweep: { value: 0 }, uA: { value: 1 } };
+let frameL = null;
+if (C.frame) frameL = sheet(cardQuad(0, 0, CW, CH, 'card'), new THREE.ShaderMaterial({ uniforms: FU, transparent: true, depthWrite: false, vertexShader: VS,
+  fragmentShader: NOISE + /* glsl */`uniform sampler2D uMap, uAnim; uniform vec2 uTiltV; uniform float uSweep, uA, uTime, uFx, uTilt, uHasAnim; varying vec2 vUv, vCard;
+    void main() {
+      vec4 f = texture2D(uMap, vUv); if (f.a < .01) discard;
+      float l = dot(f.rgb, vec3(.3, .59, .11)), metal = smoothstep(.35, .95, l);
+      vec3 irid = .5 + .5 * cos(6.2832 * (vec3(0., .33, .67) + vUv.x * 1.3 + vUv.y * .9 + uTiltV.x * 1.4 - uTiltV.y * .9 + fbm(vUv * 6.) * .6));
+      float q = (vUv.x + vUv.y * .6 - uSweep) * 5.; float band = exp(-q * q);
+      float r = hash(floor(vUv * vec2(520., 780.))); float sp = pow(max(sin(uTime * (2. + r * 4.) + r * 80.), 0.), 30.) * step(.55, r);
+      vec3 c = f.rgb + uFx * (irid * metal * (.1 + .28 * uTilt) + f.rgb * band * metal * (.5 + .6 * uTilt) + vec3(1.) * sp * metal * 1.4);
+      if (uHasAnim > .5) c += texture2D(uAnim, vUv).rgb * 1.6 * uFx;   /* the frame's own light, animated */
+      gl_FragColor = vec4(c, f.a * uA);
+      #include <colorspace_fragment>
+    }` }), 0, 0, { order: 7, t0: 0, label: ['Card frame', 'frame art, cut to a window'] });
+// the card's sides (owner, 22 Nov: "close it off on the sides with a reflection or extension of the background"): the card is a real box.
+// Each side shows the scene mirrored round the window's edge (the live background video when there is one), darker toward the back,
+// between two bands of the frame's own metal; a soft sheen moves along it as the card turns. ?box=<depth> tries another depth, ?sides=thin = the old gold edge.
+const EDGE_D = Q.get('sides') === 'thin' ? .022 : +(Q.get('box') || C.boxDepth || .13), edgeGeo = new THREE.BoxGeometry(1, CH / CW, EDGE_D);
+const SIDEU = { ...U, ...WINU, uMap: { value: BGV ? BGV.t : T.plate }, uXf: { value: vidXf(BGV && BGV.v) }, uVid: { value: BGV ? 1 : 0 }, uFrameMap: FU.uMap,
+  uHasFrame: { value: C.frame ? 1 : 0 }, uArt: { value: new THREE.Vector4(IX0, IY0, W * IS, H * IS) }, uCardS: { value: new THREE.Vector2(CW, CH) }, uD: { value: EDGE_D },
+  uTiltV: FU.uTiltV, uRimC: { value: v3c(TH.rim) }, uThin: { value: Q.get('sides') === 'thin' ? 1 : 0 } };
+const edge = new THREE.Mesh(edgeGeo, new THREE.ShaderMaterial({ uniforms: SIDEU, transparent: false, depthWrite: true,
+  vertexShader: 'varying vec3 vP, vN; void main(){ vP = position; vN = normal; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }',
+  fragmentShader: NOISE + /* glsl */`uniform sampler2D uMap, uFrameMap; uniform float uHasFrame, uVid, uD, uTime, uThin; uniform vec4 uXf, uArt; uniform vec2 uCardS, uTiltV; uniform vec3 uRimC;
+    varying vec3 vP, vN;
+    void main() {
+      if (abs(vN.z) > .5) discard;   /* the front would hide the window and the back is never seen: only the four sides */
+      float d = clamp((uD * .5 - vP.z) / uD, 0., 1.);   /* 0 at the frame, 1 at the back */
+      vec2 cp = vec2((vP.x + .5) * uCardS.x, (uCardS.y / uCardS.x * .5 - vP.y) * uCardS.x);   /* card px along this side */
+      vec3 gold = vec3(.95, .74, .36) * (.55 + .45 * abs(vN.x + vN.y));
+      vec3 fr = uHasFrame > .5 ? texture2D(uFrameMap, clamp(vec2(cp.x / uCardS.x, 1. - cp.y / uCardS.y), .012, .988)).rgb : gold;
+      if (uThin > .5) { gl_FragColor = vec4(gold, 1.); return; }
+      vec2 m = cp; float span = 220.;   /* mirror the picture round the window's edge, d * span into it */
+      if (abs(vN.x) > .5) m.x = vN.x < 0. ? uWin.x + d * span : uWin.z - d * span; else m.y = vN.y > 0. ? uWin.y + d * span : uWin.w - d * span;
+      m = clamp(m, uWin.xy + 2., uWin.zw - 2.);
+      vec2 puv = vec2((m.x - uArt.x) / uArt.z, 1. - (m.y - uArt.y) / uArt.w);
+      vec3 scene = texture2D(uMap, uVid > .5 ? clamp(puv, 0., 1.) * uXf.xy + uXf.zw : puv).rgb;
+      float along = abs(vN.x) > .5 ? cp.y / uCardS.y : cp.x / uCardS.x;
+      float sheen = pow(max(1. - abs(fract(along * .8 - uTime * .05 + dot(uTiltV, vec2(.6, .4))) - .5) * 4., 0.), 3.);
+      vec3 c = scene * (.95 - .55 * d) + (fr * .25 + uRimC * .2) * sheen * (1. - d);   /* the scene, like a reflection in polished glass */
+      float band = smoothstep(.07, .035, d) + smoothstep(.93, .965, d);   /* the frame's metal: a band at the front edge and one at the back */
+      c = mix(c, fr * (.85 + .3 * sheen), clamp(band, 0., 1.));
+      gl_FragColor = vec4(c, 1.);
+      #include <colorspace_fragment>
+    }` }));
+edge.position.z = -EDGE_D / 2 - .001; edge.renderOrder = 0; block.add(edge);
+
+// ---------- 8. particles: some inside the box, some floating in front of the card
+function particles(n, zr, kinds, order) {
+  const pos = new Float32Array(n * 3), att = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) { pos.set([(rand() - .5) * 1.05, (rand() - .5) * CH / CW * 1.05, zr[0] + rand() * (zr[1] - zr[0])], i * 3); att.set([rand(), rand(), kinds[i % kinds.length], rand()], i * 4); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('aS', new THREE.BufferAttribute(att, 4));
+  const pts = new THREE.Points(g, new THREE.ShaderMaterial({ uniforms: PU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: /* glsl */`attribute vec4 aS; uniform float uTime, uPx, uHH; varying float vA, vK; varying vec3 vC; varying float vR;
+      void main() {
+        vec3 p = position; float k = aS.z; vK = k; float sp = .01 + aS.x * .025, H2 = uHH * 2.1;
+        if (k < .5 || (k > 4.5 && k < 5.5) || (k > 6.5 && k < 7.5)) { p.y = mod(p.y - uTime * sp - aS.w * H2 + uHH * 1.05, H2) - uHH * 1.05; p.x += sin(uTime * (.5 + aS.y) + aS.x * 30.) * .03; }  /* falling: snow, petals, code */
+        else if (k < 1.5) { p.y = mod(p.y + uTime * sp * 1.6 + aS.w * H2 + uHH * 1.05, H2) - uHH * 1.05; p.x += sin(uTime * 1.3 + aS.x * 20.) * .02; }   /* embers rise */
+        else { p.x += sin(uTime * .3 + aS.x * 9.) * .02; p.y += cos(uTime * .25 + aS.y * 9.) * .02; }                                                       /* drifting */
+        vec4 mv = modelViewMatrix * vec4(p, 1.); gl_Position = projectionMatrix * mv;
+        float tw = pow(abs(sin(uTime * (1. + aS.y * 2.5) + aS.x * 40.)), 3.);
+        vA = (.25 + .75 * tw) * (1. - smoothstep(uHH * .9, uHH * 1.05, abs(p.y))); vR = aS.w;
+        vC = k < .5 ? vec3(.8, .92, 1.) : k < 1.5 ? vec3(1., .28, .32) : k < 2.5 ? vec3(.5, .8, 1.) : k < 3.5 ? vec3(1., .95, .8) : k < 4.5 ? vec3(1.) : k < 5.5 ? vec3(.95, .97, 1.) : k < 6.5 ? vec3(.35, .55, 1.) : vec3(.55, .75, 1.);
+        float s = k > 4.5 && k < 5.5 ? 26. : k > 6.5 ? 14. : k > 5.5 ? 9. : k > 3.5 && k < 4.5 ? 5. : 2.6;
+        gl_PointSize = (s * (.6 + aS.x * .8)) * uPx * (4.6 / -mv.z); }`,
+    fragmentShader: /* glsl */`uniform float uA; uniform sampler2D uAtlas; varying float vA, vK, vR; varying vec3 vC;
+      void main() { vec2 pc = gl_PointCoord; float d = length(pc - .5), a;
+        if (vK > 6.5) { vec2 cell = vec2(floor(vR * 4.), 0.); a = texture2D(uAtlas, (pc + cell) / vec2(4., 1.)).a; }         /* code glyphs */
+        else if (vK > 5.5) { a = smoothstep(.5, .2, length((pc - .5) * vec2(1., 2.2))); }                                       /* a petal */
+        else if (vK > 4.5) { a = smoothstep(.5, .0, d) * .22; }                                                                  /* a cloud puff */
+        else if (vK > 3.5 && vK < 4.5) { a = (smoothstep(.5, .0, d) * .5 + smoothstep(.06, .0, min(abs(pc.x - .5), abs(pc.y - .5))) * smoothstep(.5, .1, d)); }   /* a star glint */
+        else a = 1. - smoothstep(.0, .5, d);
+        vec3 c = vK > 2.5 && vK < 3.5 ? .5 + .5 * cos(6.28 * (vec3(0., .33, .67) + vR * 3.)) : vC;                               /* prism sparks: rainbow */
+        a *= vA * uA; if (a < .01) discard; gl_FragColor = vec4(c * a, a); }` }));
+  pts.renderOrder = order; pts.frustumCulled = false; block.add(pts); return pts;
+}
+const atlas = (() => { const c = document.createElement('canvas'); c.width = 256; c.height = 64; const g = c.getContext('2d'); g.font = '700 50px "JetBrains Mono", monospace';
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#fff'; ['{', '}', '</>', '01'].forEach((s, i) => g.fillText(s, 32 + i * 64, 34, 60)); return tex(c); })();
+const PU = { uTime: { value: 0 }, uA: { value: 1 }, uPx: { value: 1 }, uHH: { value: HALF_H }, uAtlas: { value: atlas } };
+const KIND = { snow: 0, embers: 1, shards: 2, prism: 3, sparkle: 4, cloud: 5, petals: 6, code: 7 };
+const kinds = TH.particles.map(p => KIND[p]);
+particles(260, [-.34, -.02], kinds, 4); particles(160, [.02, .4], kinds, 10);
+
+// ---------- 9. floor glow and a coloured light behind the card
+const glow = new THREE.Mesh(new THREE.PlaneGeometry(9, 5), new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, uniforms: { uA: { value: 1 }, uC: { value: v3c(TH.rays) } },
+  vertexShader: 'varying vec2 v; void main(){ v = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }',
+  fragmentShader: `uniform float uA; uniform vec3 uC; varying vec2 v; void main(){ vec2 d = (v - vec2(.5, .5)) * vec2(1.7, 2.4); float a = exp(-dot(d, d) * 3.) * .2 * uA; gl_FragColor = vec4(uC * a, a); }` }));
+glow.position.set(0, 0, -2.5); scene.add(glow);
+
+// ---------- portal style: a nebula behind the card and crystal shards bursting out of it
+const PORTAL = TH.style === 'portal';
+const NEBU = { uTime: { value: 0 }, uA: { value: 1 } };
+let shards = null;
+if (PORTAL) {
+  scene.remove(glow);
+  const neb = new THREE.Mesh(new THREE.PlaneGeometry(16, 10), new THREE.ShaderMaterial({ uniforms: NEBU, depthWrite: false,
+    vertexShader: 'varying vec2 v; void main(){ v = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }',
+    fragmentShader: NOISE.replace(/uniform vec4 uWin[^]*$/, '') + /* glsl */`uniform float uTime, uA; varying vec2 v;
+      void main() {
+        vec2 p = (v - .5) * vec2(16., 10.);
+        float n = fbm(p * .35 + vec2(uTime * .02, -uTime * .015)), n2 = fbm(p * .7 - vec2(uTime * .03, 0.) + n * 2.);
+        vec3 pink = vec3(1., .18, .55), blue = vec3(.15, .35, 1.), deep = vec3(.004, .003, .015);
+        float bx = p.x * .22 + p.y * .1 + sin(p.y * .4 + uTime * .1) * .4; float band = exp(-bx * bx * 1.2);   /* a diagonal river of light behind the card */
+        float cl = smoothstep(.42, .8, n2); vec3 c = deep + mix(blue, pink, smoothstep(.35, .7, n)) * cl * cl * 1.3 * (.08 + 1.2 * band) + pink * .04 * band;
+        vec2 cell = floor(v * vec2(900., 560.)); float r = hash(cell);
+        c += vec3(.9, .9, 1.) * step(.9975, r) * (.4 + .6 * pow(abs(sin(uTime * (1. + r * 3.) + r * 90.)), 6.));
+        gl_FragColor = vec4(c * uA, 1.);
+        #include <colorspace_fragment>
+      }` }));
+  neb.position.z = -3.2; neb.renderOrder = -1; scene.add(neb);
+  // shards: thin crystal splinters on a ring around the card; they burst out at the start, then drift and spin
+  const NSH = 110, sg = new THREE.InstancedBufferGeometry(); const base = new THREE.TetrahedronGeometry(1, 0).toNonIndexed();
+  sg.setAttribute('position', base.attributes.position); sg.setAttribute('normal', base.attributes.normal); sg.instanceCount = NSH;
+  const A = { aP: [], aAx: [], aS: [] };
+  for (let i = 0; i < NSH; i++) {
+    const ang = rand() * TAU, ring = .62 + Math.pow(rand(), .7) * .9, front = rand() < .3;
+    A.aP.push(Math.cos(ang) * ring * .95, Math.sin(ang) * ring * 1.15, front ? .05 + rand() * .5 : -.5 + rand() * .45);
+    const ax = new THREE.Vector3(rand() - .5, rand() - .5, rand() - .5).normalize(); A.aAx.push(ax.x, ax.y, ax.z);
+    A.aS.push(.02 + Math.pow(rand(), 2.2) * .07, .3 + rand() * 1.2, rand(), .35 + rand() * .5);   /* size, spin, phase, delay */
+  }
+  for (const [n, k] of [['aP', 3], ['aAx', 3], ['aS', 4]]) sg.setAttribute(n, new THREE.InstancedBufferAttribute(new Float32Array(A[n]), k));
+  const SHU = { uTime: { value: 0 }, uA: { value: 1 }, uBurst: { value: 0 } };
+  shards = new THREE.Mesh(sg, new THREE.ShaderMaterial({ uniforms: SHU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    vertexShader: /* glsl */`attribute vec3 aP, aAx; attribute vec4 aS; uniform float uTime, uBurst; varying vec3 vN, vV; varying float vK;
+      mat3 rot(vec3 a, float t) { float c = cos(t), s = sin(t), C = 1. - c; return mat3(c + a.x*a.x*C, a.y*a.x*C + a.z*s, a.z*a.x*C - a.y*s, a.x*a.y*C - a.z*s, c + a.y*a.y*C, a.z*a.y*C + a.x*s, a.x*a.z*C + a.y*s, a.y*a.z*C - a.x*s, c + a.z*a.z*C); }
+      void main() {
+        float b = clamp((uBurst - aS.w) / .9, 0., 1.); b = 1. - pow(1. - b, 3.);
+        mat3 R = rot(aAx, uTime * aS.y + aS.z * 6.28);
+        vec3 lp = R * (position * vec3(aS.x * .45, aS.x * 1.6, aS.x * .12));   /* a thin splinter */
+        float orbit = uTime * .03 * (aS.z - .5);
+        vec3 c = vec3(aP.x * cos(orbit) - aP.y * sin(orbit), aP.x * sin(orbit) + aP.y * cos(orbit), aP.z);
+        c.xy *= .15 + .85 * b; c.y += sin(uTime * .6 + aS.z * 20.) * .015;
+        vec4 mv = modelViewMatrix * vec4(c + lp * b, 1.);
+        vN = normalize(normalMatrix * (R * normal)); vV = normalize(-mv.xyz); vK = aS.z * b;
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: /* glsl */`uniform float uA; varying vec3 vN, vV; varying float vK;
+      void main() {
+        float f = 1. - abs(dot(normalize(vN), normalize(vV)));
+        vec3 irid = .5 + .5 * cos(6.2832 * (vec3(0., .33, .67) + f * 1.2 + vK * 2.));
+        vec3 c = mix(vec3(.45, .65, 1.), vec3(1., .4, .75), vK) * (.03 + .55 * f * f) + irid * f * f * .3 + vec3(1.) * pow(max(dot(reflect(-vec3(-.4, .6, .7), normalize(vN)), vV), 0.), 40.) * .8;
+        gl_FragColor = vec4(c * uA * step(.001, vK), 1.);
+      }` }));
+  shards.frustumCulled = false; shards.renderOrder = 11; block.add(shards);
+  shards.userData.U = SHU;
+}
+
+// debug: ?hide=steps,aura,glyph,rays,bg,frame,parts,planes hides those layers
+const HIDE = new Set((Q.get('hide') || '').split(',').filter(Boolean));
+if (HIDE.size) block.traverse(o => { const m = o.material;
+  const name = walls.some(w => w.m === o) ? 'walls' : o === edge ? 'edge' : o === backSteps || o === frontSteps || (sceneSteps && o === sceneSteps) ? 'steps' : o.isPoints ? 'parts' : m === bgMat ? 'bg' : frameL && o === frameL.mesh ? 'frame' : m?.uniforms?.uAmt ? 'aura' : m?.uniforms?.uMap && o.geometry?.parameters === undefined && m.blending === THREE.AdditiveBlending ? 'glyph' : m?.uniforms?.uCol && m.blending === THREE.AdditiveBlending ? 'rays' : m?.uniforms?.uFront ? 'planes' : '';
+  if (HIDE.has(name)) o.visible = false; });
+
+// ---------- labels for the pulled-apart view
+const tagsEl = document.getElementById('tags');
+const tagged = [...layers.filter(s => s.label), stepLabel].map(s => { const el = document.createElement('div'); el.className = 'tag'; el.innerHTML = `${s.label[0]}<small>${s.label[1]}</small>`; tagsEl.appendChild(el); return { s, el }; });
+const tagY = s => ({ Background: .3, Crystals: .45, 'Magic glyph': .62, Aura: .78, 'Card frame': .93, 'Front crystals': .55 })[s.label[0]] ?? .12;
+
+// ---------- motion: spring tilt toward the pointer, idle sway, click to pull apart; ?rec plays a fixed 16 s script
+const ptr = { x: 0, y: 0, last: -1e9 }; let explodeTo = 0;
+canvas.addEventListener('pointermove', e => { ptr.x = e.clientX / innerWidth * 2 - 1; ptr.y = e.clientY / innerHeight * 2 - 1; ptr.last = performance.now(); });
+canvas.addEventListener('pointerleave', () => { ptr.last = -1e9; });
+canvas.addEventListener('click', () => { explodeTo = explodeTo ? 0 : 1; });
+function scripted(t) {
+  const k = smooth(3.0, 4.0, t), u = t - 3;
+  const X = smooth(8.6, 9.8, t) * (1 - smooth(13.6, 14.8, t));
+  const front = smooth(10.6, 11.6, t) * (1 - smooth(12.4, 13.3, t));
+  return { x: k * (.75 * Math.sin(u * .62) + .1 * Math.sin(u * 1.9)) * (1 - X), y: k * .6 * Math.sin(u * .85 + .5) * (1 - X), X, front };
+}
+const S = { rx: 0, ry: 0, vx: 0, vy: 0, X: 0, vX: 0 }; let simT = 0; const DT = 1 / 240;
+function physics(t, dt, now) {
+  let tx, ty, tX, front = 0;
+  if (FRONT) { tx = ty = tX = 0; }
+  else if (POSE) { tx = POSE[1] / 22; ty = -POSE[0] / 16; tX = 0; }
+  else if (AUTO) ({ x: tx, y: ty, X: tX, front } = scripted(t));
+  else if (now - ptr.last < 2500) { tx = ptr.x; ty = ptr.y; tX = explodeTo; } else { tx = .5 * Math.sin(t * .45); ty = .35 * Math.sin(t * .7 + 1); tX = explodeTo; }
+  const ex = smooth(0, 1, S.X);
+  const gx = lerp(-ty * 16, 12, ex) * (1 - front), gy = lerp(tx * 22, -50, ex) * (1 - front);
+  const k = 38, d = 2 * Math.sqrt(k) * .75, kx = 16, dx = 2 * Math.sqrt(kx) * .9;
+  S.vx += (gx - S.rx) * k * dt - S.vx * d * dt; S.vy += (gy - S.ry) * k * dt - S.vy * d * dt; S.vX += (tX - S.X) * kx * dt - S.vX * dx * dt;
+  S.rx += S.vx * dt; S.ry += S.vy * dt; S.X += S.vX * dt;
+}
+const rad = Math.PI / 180, t0 = performance.now(), v3 = new THREE.Vector3(), nW = new THREE.Vector3();
+function draw(t) {
+  const now = performance.now(); while (simT + DT <= t) { physics(simT, DT, now); simT += DT; }
+  const X = clamp(S.X, -.05, 1.1), Xs = smooth(0, 1, X), tilt = clamp(Math.hypot(S.rx, S.ry) / 18, 0, 1);
+  const pop = 1 - Math.pow(1 - smooth(0, 1.3, t), 3);
+  block.rotation.set(S.rx * rad, S.ry * rad + (1 - pop) * .5, 0, 'XYZ');
+  block.position.set(0, Math.sin(t * 1.05) * .006, -(1 - pop) * 2.5 - Xs * 1.15);
+  block.updateMatrixWorld(); camera.updateMatrixWorld();
+  SU.uNM.value.getNormalMatrix(new THREE.Matrix4().multiplyMatrices(camera.matrixWorldInverse, block.matrixWorld));
+  const L2 = new THREE.Vector2(-S.ry, S.rx); if (L2.length() < 1e-3) L2.set(0, 1); SU.uL2.value.copy(L2.normalize());
+  U.uX.value = Xs; U.uTime.value = t; U.uTilt.value = tilt; block.updateMatrixWorld(); CAMU.uCam.value.copy(block.worldToLocal(camera.position.clone()));
+  for (const M of [bgMat, stepMat]) { M.uniforms.uX.value = Xs; M.uniforms.uTime.value = t; M.uniforms.uTilt.value = tilt; }
+  for (const L of layers) {
+    const z = lerp(L.z, L.ze, Xs), k = (DC - z) / DC, p = smooth(L.t0, L.t0 + .7, t);
+    L.mesh.position.set(0, 0, z); L.mesh.scale.set(k, k, 1);
+    const u = L.mesh.material.uniforms; if (u.uPz) u.uPz.value.set(z, k); for (const n of ['uX', 'uTime', 'uTilt']) if (u[n]) u[n].value = n === 'uX' ? Xs : n === 'uTime' ? t : tilt;
+    if (u.uA) u.uA.value = p * (L.fx ? smooth(1.8, 3, t) : 1) * (L.sx ? Xs : 1);
+  }
+  placeWalls(lerp(Z_BACK, -1.0, Xs) * 1, (1 - Xs) * smooth(.4, 1.2, t));
+  for (const { m, side } of walls) {   // a wall facing the light is brighter
+    nW.set(side === 'L' ? 1 : side === 'R' ? -1 : 0, side === 'T' ? -1 : side === 'B' ? 1 : 0, 0).applyQuaternion(block.quaternion);
+    m.material.uniforms.uLit.value = .25 + .75 * Math.max(0, nW.dot(new THREE.Vector3(-.4, .6, .7).normalize()) + .3);
+    m.material.uniforms.uTime.value = t;
+  }
+  FU.uTiltV.value.set(S.ry / 20, S.rx / 20); FU.uSweep.value = .7 + S.ry * .045 - S.rx * .03;
+  PU.uTime.value = t; PU.uA.value = PURE ? 0 : smooth(2.6, 3.6, t) * (.6 + .4 * tilt) * (1 - Xs * .7); PU.uPx.value = renderer.getPixelRatio() * innerHeight / 900;
+  bloom.strength = PURE ? 0 : (TH.bloom[0] + .3 * TH.bloom[0] * tilt) * smooth(1.5, 3, t);
+  edge.visible = Xs < .01 && !HIDE.has?.("edge");   // solid sides: gone while the layers are pulled apart
+  NEBU.uTime.value = t; NEBU.uA.value = PURE ? .4 : 1;
+  if (shards) { const u = shards.userData.U; u.uTime.value = t; u.uBurst.value = t; u.uA.value = PURE ? 0 : 1 - Xs * .8; }
+  for (const { s, el } of tagged) {
+    const z = lerp(s.z, s.ze, Xs), k = (DC - z) / DC;
+    v3.set(wx(WIN.x1 + 40) * k, wy(WIN.y0 + (WIN.y1 - WIN.y0) * tagY(s)) * k, z).applyMatrix4(block.matrixWorld).project(camera);
+    el.style.transform = `translate(${((v3.x + 1) / 2 * innerWidth + 26).toFixed(1)}px, ${((1 - v3.y) / 2 * innerHeight).toFixed(1)}px)`;
+    el.style.opacity = smooth(.55, .95, X).toFixed(3);
+  }
+  composer.render();
+}
+window.__cardRect = () => { const a = new THREE.Vector3(wx(0), wy(0), 0).applyMatrix4(block.matrixWorld).project(camera), b = new THREE.Vector3(wx(CW), wy(CH), 0).applyMatrix4(block.matrixWorld).project(camera);
+  return { left: (a.x + 1) / 2 * innerWidth, top: (1 - a.y) / 2 * innerHeight, height: (a.y - b.y) / 2 * innerHeight }; };
+if (REC) { await seekAll(0); draw(0); draw(0); window.__frame = async t => { await seekAll(t); draw(t); return true; }; window.__ready = true; }
+else { const loop = () => { draw((performance.now() - t0) / 1000); requestAnimationFrame(loop); }; loop(); }
+</script>
+</body></html>
